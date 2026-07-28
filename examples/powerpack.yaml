@@ -22,7 +22,7 @@ esp32:
       minimum_chip_revision: "3.0"
 
 external_components:
-  - source: github://poindexter12/powerpack
+  - source: github://poindexter12/enphase-powerpack-1500
     components: [powerpack_ble]
 
 wifi:

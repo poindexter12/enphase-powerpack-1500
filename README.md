@@ -20,7 +20,7 @@ substitutions:
   powerpack_ble_mac: "AA:BB:CC:DD:EE:FF"   # your unit's BLE MAC (advertises as PES_<serial>)
 
 external_components:
-  - source: github://poindexter12/powerpack
+  - source: github://poindexter12/enphase-powerpack-1500
     components: [powerpack_ble]
 
 esp32_ble_tracker:
