@@ -1,0 +1,157 @@
+# Enphase IQ PowerPack 1500 -> Home Assistant, via a standard ESP32 (WROOM) + ESPHome.
+# Full config: every scalar telemetry field as a sensor, plus the confirmed controls.
+#
+# Per-unit values go in `substitutions:`; wifi/api/ota credentials in secrets.yaml.
+
+substitutions:
+  friendly_name: "Enphase PowerPack 1500"
+  powerpack_ble_mac: "AA:BB:CC:DD:EE:FF"   # your unit's BLE MAC (advertises as PES_<serial>)
+  report_fast: 60s    # battery/charge flow & state
+  report_slow: 5min   # everything else
+
+esphome:
+  name: enphase-powerpack
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      sram1_as_iram: true
+      minimum_chip_revision: "3.0"
+
+external_components:
+  - source: github://poindexter12/powerpack
+    components: [powerpack_ble]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} AP"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+logger:
+  level: INFO          # DEBUG shows per-frame BLE + parser detail when needed
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 320ms
+    window: 30ms
+    active: false
+
+ble_client:
+  - mac_address: ${powerpack_ble_mac}
+    id: pp_client
+
+# Custom component: connect unbonded, subscribe directly to the telemetry char, parse JSON.
+# service_uuid / characteristic_uuid / control_characteristic_uuid default to the
+# PowerPack's UUIDs (6d1b33f8-...); override only if your unit differs.
+powerpack_ble:
+  id: pp_ctl
+  ble_client_id: pp_client
+  # Frames arrive 1-2x/sec; throttle to report_fast (battery/charge flow) or report_slow.
+  battery: {name: "Battery", filters: [throttle: "${report_fast}"]}
+  state_of_health: {name: "State of Health", filters: [throttle: "${report_slow}"]}
+  battery_power: {name: "Battery Power", filters: [throttle: "${report_fast}"]}
+  storage_power: {name: "Storage Power", filters: [throttle: "${report_fast}"]}
+  ac_load: {name: "AC Load", filters: [throttle: "${report_slow}"]}
+  grid_input: {name: "Grid Input", filters: [throttle: "${report_fast}"]}
+  solar_input: {name: "Solar Input", filters: [throttle: "${report_fast}"]}
+  inverter_output: {name: "Inverter Output", filters: [throttle: "${report_slow}"]}
+  battery_voltage: {name: "Battery Voltage", filters: [throttle: "${report_slow}"]}
+  battery_current: {name: "Battery Current", filters: [throttle: "${report_slow}"]}
+  battery_temp: {name: "Battery Temp", filters: [throttle: "${report_slow}"]}
+  battery_temp_max: {name: "Battery Temp Max", filters: [throttle: "${report_slow}"]}
+  ac_output_voltage: {name: "AC Output Voltage", filters: [throttle: "${report_slow}"]}
+  ac_output_current: {name: "AC Output Current", filters: [throttle: "${report_slow}"]}
+  ac_output_frequency: {name: "AC Output Frequency", filters: [throttle: "${report_slow}"]}
+  backup_time: {name: "Backup Time", filters: [throttle: "${report_fast}"]}
+  time_to_full: {name: "Time To Full", filters: [throttle: "${report_fast}"]}
+  battery_cycles: {name: "Battery Cycles", filters: [throttle: "${report_slow}"]}
+  cellular_signal: {name: "Cellular Signal", filters: [throttle: "${report_slow}"]}
+  battery_temp_min: {name: "Battery Temp Min", filters: [throttle: "${report_slow}"]}
+  cell_voltage_avg: {name: "Cell Voltage Avg", filters: [throttle: "${report_slow}"]}
+  cell_voltage_min: {name: "Cell Voltage Min", filters: [throttle: "${report_slow}"]}
+  cell_voltage_max: {name: "Cell Voltage Max", filters: [throttle: "${report_slow}"]}
+  usb_load: {name: "USB Load", filters: [throttle: "${report_slow}"]}
+  aux_load: {name: "Aux Load", filters: [throttle: "${report_slow}"]}
+  usb_voltage: {name: "USB Voltage", filters: [throttle: "${report_slow}"]}
+  usb_current: {name: "USB Current", filters: [throttle: "${report_slow}"]}
+  external_ac_input: {name: "External AC Input", filters: [throttle: "${report_slow}"]}
+  dc_12v_input: {name: "DC 12V Input", filters: [throttle: "${report_slow}"]}
+  grid_voltage: {name: "Grid Voltage", filters: [throttle: "${report_slow}"]}
+  grid_current: {name: "Grid Current", filters: [throttle: "${report_slow}"]}
+  grid_frequency: {name: "Grid Frequency", filters: [throttle: "${report_slow}"]}
+  solar_voltage: {name: "Solar Voltage", filters: [throttle: "${report_slow}"]}
+  solar_current: {name: "Solar Current", filters: [throttle: "${report_slow}"]}
+  fan1_duty: {name: "Fan 1 Duty", filters: [throttle: "${report_slow}"]}
+  fan2_duty: {name: "Fan 2 Duty", filters: [throttle: "${report_slow}"]}
+  fan3_duty: {name: "Fan 3 Duty", filters: [throttle: "${report_slow}"]}
+
+sensor:
+  - platform: wifi_signal
+    name: "PowerPack WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "PowerPack Uptime"
+
+text_sensor:
+  - platform: version
+    name: "PowerPack ESPHome Version"
+
+binary_sensor:
+  - platform: status
+    name: "PowerPack Status"
+
+# Controls. NOTE: the PowerPack has no "battery vs grid" mode — it's an automatic
+# UPS (grid present = passthrough + charge; grid lost = battery in <10ms). To force
+# battery you physically unplug AC. So we expose only the settings that ARE
+# user-controllable, all via the plaintext write path to the control characteristic
+# (confirmed live: toggling USB/12V physically switches those outputs).
+switch:
+  - platform: template
+    name: "PowerPack USB Output"      # usoe
+    optimistic: true
+    turn_on_action:
+      - lambda: 'id(pp_ctl).send_setting("usoe", 1);'
+    turn_off_action:
+      - lambda: 'id(pp_ctl).send_setting("usoe", 0);'
+  - platform: template
+    name: "PowerPack 12V Output"      # axoe
+    optimistic: true
+    turn_on_action:
+      - lambda: 'id(pp_ctl).send_setting("axoe", 1);'
+    turn_off_action:
+      - lambda: 'id(pp_ctl).send_setting("axoe", 0);'
+  - platform: template
+    name: "PowerPack Fast Charge"     # fchg
+    optimistic: true
+    turn_on_action:
+      - lambda: 'id(pp_ctl).send_setting("fchg", 1);'
+    turn_off_action:
+      - lambda: 'id(pp_ctl).send_setting("fchg", 0);'
+
+number:
+  # gicl = AC grid input current limit (how much the unit draws from the wall,
+  # shared between charging + passthrough). 150 ≈ 15 A; exact units unconfirmed.
+  # Lower it to throttle wall draw on a weak circuit; it is NOT a battery/grid switch.
+  - platform: template
+    name: "PowerPack Grid Input Limit"
+    optimistic: true
+    min_value: 0
+    max_value: 150
+    step: 10
+    set_action:
+      - lambda: 'id(pp_ctl).send_setting("gicl", (int) x);'
