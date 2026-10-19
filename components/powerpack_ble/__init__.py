@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import sensor, ble_client
+from esphome.components import sensor, text_sensor, ble_client
 from esphome.const import (
     CONF_ID,
     UNIT_PERCENT,
@@ -25,7 +25,7 @@ from esphome.const import (
 
 CODEOWNERS = ["@poindexter12"]
 DEPENDENCIES = ["ble_client"]
-AUTO_LOAD = ["sensor"]
+AUTO_LOAD = ["sensor", "text_sensor"]
 
 powerpack_ble_ns = cg.esphome_ns.namespace("powerpack_ble")
 PowerPackBLE = powerpack_ble_ns.class_(
@@ -35,6 +35,23 @@ PowerPackBLE = powerpack_ble_ns.class_(
 CONF_SERVICE_UUID = "service_uuid"
 CONF_CHARACTERISTIC_UUID = "characteristic_uuid"
 CONF_CONTROL_CHARACTERISTIC_UUID = "control_characteristic_uuid"
+CONF_RAW_FIELDS = "raw_fields"
+CONF_KEY = "key"
+
+# raw_fields: publish chosen JSON keys verbatim as text sensors, on change only. No
+# wildcard: ESPHome entities are fixed at compile time, so every key needs its own
+# declared sensor. To discover keys, read the "RAW _s/_m:" INFO log line instead.
+RAW_FIELD_SCHEMA = text_sensor.text_sensor_schema().extend(
+    {cv.Required(CONF_KEY): cv.string_strict}
+)
+
+
+def _unique_raw_keys(fields):
+    keys = [f[CONF_KEY] for f in fields]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    if dupes:
+        raise cv.Invalid(f"duplicate raw_fields key(s): {', '.join(dupes)}")
+    return fields
 
 
 def _s(unit, dclass, sclass, decimals):
@@ -104,6 +121,9 @@ CONFIG_SCHEMA = (
                 default="6d1b33f8-0014-11eb-a8b3-0242ac130003",
             ): cv.string,
             **{cv.Optional(k): schema for k, (_, schema) in SENSORS.items()},
+            cv.Optional(CONF_RAW_FIELDS): cv.All(
+                cv.ensure_list(RAW_FIELD_SCHEMA), _unique_raw_keys
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -122,3 +142,6 @@ async def to_code(config):
         if key in config:
             sens = await sensor.new_sensor(config[key])
             cg.add(var.add_field(json_key, sens))
+    for rf in config.get(CONF_RAW_FIELDS, []):
+        ts = await text_sensor.new_text_sensor(rf)
+        cg.add(var.add_raw_field(rf[CONF_KEY], ts))

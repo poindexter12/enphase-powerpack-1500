@@ -3,6 +3,7 @@
 #include "esphome/core/component.h"
 #include "esphome/components/ble_client/ble_client.h"
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/esp32_ble/ble_uuid.h"
 
 #include <string>
@@ -35,6 +36,11 @@ class PowerPackBLE : public Component, public ble_client::BLEClientNode {
   void add_field(const std::string &json_key, sensor::Sensor *s) {
     this->fields_.emplace_back(json_key, s);
   }
+  // Publish a key's value as the raw JSON text (strings keep their quotes, numbers
+  // their exact formatting), on change only. For undecoded fields that may not be numeric.
+  void add_raw_field(const std::string &json_key, text_sensor::TextSensor *s) {
+    this->raw_fields_.push_back(RawField{json_key, s, std::string(), false});
+  }
 
   // --- Control (write) surface ---
   // The app writes plaintext JSON settings to a sibling characteristic on the same
@@ -59,8 +65,17 @@ class PowerPackBLE : public Component, public ble_client::BLEClientNode {
   uint16_t control_handle_{0};
   float last_gicl_{NAN};  // device's last-seen non-zero grid input limit (for restore)
   std::string mode_sig_;  // last logged mode/settings signature (log only on change)
+  std::string raw_sig_;   // last logged *_s / *_m raw signature (log only on change)
   std::string buf_;
   std::vector<std::pair<std::string, sensor::Sensor *>> fields_;
+
+  struct RawField {
+    std::string key;
+    text_sensor::TextSensor *sensor;
+    std::string last;
+    bool published;
+  };
+  std::vector<RawField> raw_fields_;
 };
 
 }  // namespace powerpack_ble

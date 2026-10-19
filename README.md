@@ -62,6 +62,19 @@ Every scalar field in the telemetry frame is available as an optional sensor —
 
 Full field-by-field notes: [docs/telemetry-fields.md](docs/telemetry-fields.md).
 
+### Raw fields (undecoded modes and states)
+
+Some fields are undecoded enums, and some may be strings, which a numeric sensor would read as 0. `raw_fields` publishes chosen keys as text sensors holding the raw JSON text (strings keep their quotes), on change only:
+
+```yaml
+powerpack_ble:
+  raw_fields:
+    - {key: op_m, name: "Operating Mode (raw)"}
+    - {key: conn_m, name: "Connection Mode (raw)"}
+```
+
+There is no wildcard: ESPHome entities are fixed at compile time, so each key needs its own sensor. To find candidate keys, watch the INFO log. Every frame's keys ending in `_s` or `_m` are logged as one sorted `RAW _s/_m: key=value ...` line, and that line is logged again only when a value changes.
+
 ## Controls
 
 Settings are written as plaintext JSON to the control characteristic via `send_setting(key, value)` — expose them as template switches/numbers (see the example yaml):
