@@ -45,6 +45,27 @@ powerpack_ble:
 
 A complete config with all sensors, throttling, and controls is in [`examples/powerpack.yaml`](examples/powerpack.yaml).
 
+> **Pin a commit.** `github://poindexter12/enphase-powerpack-1500` tracks the default branch, so with
+> `refresh: 0s` every build picks up whatever was pushed last. For a device you rely on, pin a reviewed
+> commit, `source: github://poindexter12/enphase-powerpack-1500@<sha>`, and bump the sha on purpose.
+
+## Link health
+
+Two optional diagnostic entities report whether telemetry is flowing. Both are polled every
+10 s, never per frame:
+
+```yaml
+powerpack_ble:
+  connected: {name: "PowerPack BLE Connected"}       # binary_sensor, connectivity
+  last_frame_age: {name: "PowerPack Last Frame Age"}  # seconds since the last parsed frame
+```
+
+When the BLE link drops, every field sensor is published as NAN, which HA shows as
+`unknown`. Text sensors cannot hold NAN, so every `raw_fields` text sensor is published as
+the literal `unknown` instead. Values return with the first frame after reconnect.
+`last_frame_age` keeps counting while the link is down, so alert on it, not on the
+field sensors.
+
 ## Sensors
 
 Every scalar field in the telemetry frame is available as an optional sensor — declare only the ones you want. Highlights:
@@ -61,6 +82,19 @@ Every scalar field in the telemetry frame is available as an optional sensor —
 | `battery_voltage/current/temp*`, `cell_voltage_*`, `grid_*`, `ac_output_*`, `fan*_duty`, `battery_cycles`, `cellular_signal` | … | Full electrical/thermal detail |
 
 Full field-by-field notes: [docs/telemetry-fields.md](docs/telemetry-fields.md).
+
+### Raw fields (undecoded modes and states)
+
+Some fields are undecoded enums, and some may be strings, which a numeric sensor would read as 0. `raw_fields` publishes chosen keys as text sensors holding the raw JSON text (strings keep their quotes), on change only:
+
+```yaml
+powerpack_ble:
+  raw_fields:
+    - {key: op_m, name: "Operating Mode (raw)"}
+    - {key: conn_m, name: "Connection Mode (raw)"}
+```
+
+There is no wildcard: ESPHome entities are fixed at compile time, so each key needs its own sensor. To find candidate keys, watch the INFO log. Every frame's keys ending in `_s` or `_m` are logged as one sorted `RAW _s/_m: key=value ...` line, and that line is logged again only when a value changes.
 
 ## Controls
 

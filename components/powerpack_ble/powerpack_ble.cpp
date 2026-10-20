@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <map>
 
 namespace esphome {
 namespace powerpack_ble {
@@ -35,6 +36,7 @@ void PowerPackBLE::dump_config() {
   ESP_LOGCONFIG(TAG, "  characteristic: %s", this->char_uuid_str_.c_str());
   ESP_LOGCONFIG(TAG, "  control char:   %s", this->control_uuid_str_.c_str());
   ESP_LOGCONFIG(TAG, "  fields:         %u", (unsigned) this->fields_.size());
+  ESP_LOGCONFIG(TAG, "  raw fields:     %u", (unsigned) this->raw_fields_.size());
 }
 
 // Find "key": in the JSON text and parse the number after it. Leading quote prevents
@@ -45,9 +47,99 @@ static float extract_num(const std::string &o, const std::string &key) {
   if (p == std::string::npos)
     return NAN;
   p += pat.size();
-  while (p < o.size() && o[p] == ' ')
-    p++;
-  return strtof(o.c_str() + p, nullptr);
+  // strtof skips leading whitespace itself. If it consumed nothing (a string, true,
+  // false, null, an object), the key has no numeric value: NAN, never a fake 0.
+  const char *s = o.c_str() + p;
+  char *end = nullptr;
+  float v = strtof(s, &end);
+  if (end == s)
+    return NAN;
+  return v;
+}
+
+// A buffered partial frame longer than this is discarded (no real frame is near it).
+static const size_t MAX_BUFFER = 16384;
+// last_frame_age / connected poll period. Kept at 10 s so HA is not flooded per frame.
+static const uint32_t POLL_INTERVAL_MS = 10000;
+// Text sensors cannot hold NAN. HA maps this literal state to its own "unknown".
+static const char *const UNKNOWN_TEXT = "unknown";
+
+// --- Raw JSON scanning (string-safe) ---
+// Index just past the string starting at o[i] == '"' (handles backslash escapes).
+static size_t skip_string(const std::string &o, size_t i) {
+  size_t n = o.size();
+  for (size_t j = i + 1; j < n; j++) {
+    if (o[j] == '\\')
+      j++;
+    else if (o[j] == '"')
+      return j + 1;
+  }
+  return n;
+}
+
+// Index just past the JSON value starting at o[j]: a string, a balanced object/array,
+// or a bare token (number, true, false, null).
+static size_t value_end(const std::string &o, size_t j) {
+  size_t n = o.size();
+  if (j >= n)
+    return n;
+  char c = o[j];
+  if (c == '"')
+    return skip_string(o, j);
+  if (c == '{' || c == '[') {
+    int depth = 0;
+    while (j < n) {
+      char d = o[j];
+      if (d == '"') {
+        j = skip_string(o, j);
+        continue;
+      }
+      if (d == '{' || d == '[')
+        depth++;
+      else if (d == '}' || d == ']') {
+        if (--depth == 0)
+          return j + 1;
+      }
+      j++;
+    }
+    return n;
+  }
+  while (j < n && o[j] != ',' && o[j] != '}' && o[j] != ']' && o[j] != ' ' && o[j] != '\t' &&
+         o[j] != '\r' && o[j] != '\n')
+    j++;
+  return j;
+}
+
+// Calls fn(key, raw_value_text) for every "key": value pair in the frame, at any depth.
+// Raw text means string values keep their quotes and numbers keep their exact formatting.
+template<typename F> static void for_each_kv(const std::string &o, F fn) {
+  size_t i = 0, n = o.size();
+  while (i < n) {
+    if (o[i] != '"') {
+      i++;
+      continue;
+    }
+    size_t ke = skip_string(o, i);
+    size_t j = ke;
+    while (j < n && o[j] == ' ')
+      j++;
+    if (j >= n || o[j] != ':') {
+      i = ke;  // a string value or array element, not a key
+      continue;
+    }
+    j++;
+    while (j < n && o[j] == ' ')
+      j++;
+    size_t ve = value_end(o, j);
+    fn(o.substr(i + 1, ke - i - 2), o.substr(j, ve - j));
+    // Step into objects/arrays so nested keys are visited too.
+    i = (j < n && (o[j] == '{' || o[j] == '[')) ? j + 1 : ve;
+  }
+}
+
+static bool is_mode_or_state_key(const std::string &k) {
+  size_t n = k.size();
+  return n > 2 && k[n - 2] == '_' && (k[n - 1] == 's' || k[n - 1] == 'm');
 }
 
 void PowerPackBLE::subscribe_() {
@@ -118,7 +210,7 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       if (param->read.status == ESP_GATT_OK && param->read.handle == this->char_handle_ &&
           param->read.value_len > 0) {
         this->buf_.append((const char *) param->read.value, param->read.value_len);
-        this->process_buffer_();
+        this->process_buffer_();  // applies the MAX_BUFFER cap on this path too
       }
       break;
     }
@@ -136,8 +228,6 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       if (param->notify.handle != this->char_handle_)
         break;
       this->buf_.append((const char *) param->notify.value, param->notify.value_len);
-      if (this->buf_.size() > 16384)
-        this->buf_.clear();
       this->process_buffer_();
       break;
     }
@@ -146,6 +236,7 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->buf_.clear();
       this->char_handle_ = 0;
       this->control_handle_ = 0;
+      this->publish_unavailable_();
       break;
     }
     default:
@@ -190,34 +281,90 @@ void PowerPackBLE::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
   }
 }
 
+void PowerPackBLE::loop() {
+  const uint32_t now = millis();
+  if (now - this->last_poll_ms_ < POLL_INTERVAL_MS)
+    return;
+  this->last_poll_ms_ = now;
+  if (this->connected_sensor_ != nullptr)
+    this->connected_sensor_->publish_state(this->parent()->connected());
+  // No frame since boot: leave it without a state rather than invent an age.
+  if (this->last_frame_age_sensor_ != nullptr && this->have_frame_)
+    this->last_frame_age_sensor_->publish_state((now - this->last_frame_ms_) / 1000.0f);
+}
+
+void PowerPackBLE::publish_unavailable_() {
+  if (this->connected_sensor_ != nullptr)
+    this->connected_sensor_->publish_state(false);
+  if (this->unavailable_published_)
+    return;
+  this->unavailable_published_ = true;
+  ESP_LOGI(TAG, "link lost: field sensors -> NAN, raw fields -> \"%s\"", UNKNOWN_TEXT);
+  for (auto &field : this->fields_)
+    field.second->publish_state(NAN);
+  for (auto &rf : this->raw_fields_) {
+    rf.sensor->publish_state(UNKNOWN_TEXT);
+    rf.last.clear();
+    rf.published = false;  // the first frame after reconnect republishes every key
+  }
+  // Re-log both signatures on the first frame after reconnect.
+  this->mode_sig_.clear();
+  this->raw_sig_.clear();
+}
+
 void PowerPackBLE::process_buffer_() {
-  // Extract every complete top-level {...} object from the growing buffer.
-  while (true) {
-    int depth = 0, start = -1, endp = -1;
-    for (size_t i = 0; i < this->buf_.size(); i++) {
-      char c = this->buf_[i];
-      if (c == '{') {
-        if (depth == 0)
-          start = (int) i;
-        depth++;
-      } else if (c == '}') {
-        depth--;
-        if (depth == 0) {
-          endp = (int) i;
-          break;
-        }
+  // Extract every complete top-level {...} object from the buffer in one pass.
+  // Braces inside JSON strings do not count (honouring \" escapes); a quote outside
+  // any object is junk and ignored. A '}' with no open object (depth would go
+  // negative) resets the scan and discards every byte through it, so one stray
+  // brace can no longer wedge the parser until the size cap clears it.
+  const size_t n = this->buf_.size();
+  int depth = 0;
+  bool in_str = false, esc = false;
+  size_t start = 0, keep_from = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char c = this->buf_[i];
+    if (in_str) {
+      if (esc)
+        esc = false;
+      else if (c == '\\')
+        esc = true;
+      else if (c == '"')
+        in_str = false;
+      continue;
+    }
+    if (c == '"') {
+      if (depth > 0)
+        in_str = true;
+    } else if (c == '{') {
+      if (depth == 0)
+        start = i;
+      depth++;
+    } else if (c == '}') {
+      if (depth == 0) {
+        ESP_LOGD(TAG, "stray '}' at offset %u, discarding %u byte(s)", (unsigned) i, (unsigned) (i + 1 - keep_from));
+        keep_from = i + 1;
+        continue;
+      }
+      if (--depth == 0) {
+        this->publish_frame_(this->buf_.substr(start, i - start + 1));
+        keep_from = i + 1;
       }
     }
-    if (endp < 0 || start < 0)
-      break;
-    std::string obj = this->buf_.substr(start, endp - start + 1);
-    this->buf_.erase(0, endp + 1);
-    this->publish_frame_(obj);
+  }
+  // Keep only an object still being received; anything before it is junk.
+  this->buf_.erase(0, depth > 0 ? start : n);
+  if (this->buf_.size() > MAX_BUFFER) {
+    ESP_LOGW(TAG, "partial frame exceeds %u bytes, discarding", (unsigned) MAX_BUFFER);
+    this->buf_.clear();
   }
 }
 
 void PowerPackBLE::publish_frame_(const std::string &json) {
   ESP_LOGV(TAG, "telemetry frame (%u bytes): %.60s...", (unsigned) json.size(), json.c_str());
+  this->last_frame_ms_ = millis();
+  this->have_frame_ = true;
+  this->unavailable_published_ = false;
   for (auto &field : this->fields_) {
     float v = extract_num(json, field.first);
     if (!std::isnan(v))
@@ -247,6 +394,37 @@ void PowerPackBLE::publish_frame_(const std::string &json) {
   if (sig != this->mode_sig_) {
     ESP_LOGI(TAG, "MODE/SETTINGS: %s", sig.c_str());
     this->mode_sig_ = sig;
+  }
+
+  // Every key ending in _s or _m, as raw text so string values survive (strtof would
+  // read them as 0). Sorted by key; first occurrence wins if a key repeats at depth.
+  // Logged only when the signature changes. Also feeds the raw_fields text sensors.
+  std::map<std::string, std::string> raw;
+  for_each_kv(json, [&](const std::string &k, const std::string &v) {
+    if (is_mode_or_state_key(k))
+      raw.emplace(k, v);
+    for (auto &rf : this->raw_fields_) {
+      if (rf.key != k)
+        continue;
+      std::string text = v.size() > 255 ? v.substr(0, 255) : v;  // HA state limit
+      if (!rf.published || text != rf.last) {
+        rf.sensor->publish_state(text);
+        rf.last = text;
+        rf.published = true;
+      }
+    }
+  });
+  std::string raw_sig;
+  for (auto &kv : raw) {
+    if (!raw_sig.empty())
+      raw_sig += ' ';
+    raw_sig += kv.first;
+    raw_sig += '=';
+    raw_sig += kv.second;
+  }
+  if (raw_sig != this->raw_sig_) {
+    ESP_LOGI(TAG, "RAW _s/_m: %s", raw_sig.empty() ? "(none)" : raw_sig.c_str());
+    this->raw_sig_ = raw_sig;
   }
 }
 

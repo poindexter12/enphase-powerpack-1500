@@ -64,6 +64,47 @@ Captured example values in parentheses (unit discharging ~418 W into an AC load)
 `*_m` = mode, `*_s` = status/fault, e.g. `op_m`(operating), `bat_m`, `ac_m`, `cell_m`,
 `ble_m`, `conn_m`. `uiBat2Load:1` etc. are the app's flow-arrow booleans.
 
+#### Discovering `*_s` / `*_m` names: the signature log
+
+The full set of `*_s` and `*_m` keys is not documented anywhere. To discover it, read
+the component's INFO log rather than guessing names. Each frame's keys ending in `_s` or `_m`
+(at any depth) are logged as one sorted line, and the line is logged again only when a
+value changes:
+
+```
+[I][powerpack_ble]: RAW _s/_m: ac_m=2 bat_m=4 ble_m=2 cell_m=2 conn_m=2 op_m=2 ...
+```
+
+Values are the raw JSON text, so string values keep their quotes. To decode a key, change
+one thing on the unit (unplug AC, toggle an output, let it charge) and see which values
+move. To expose a key in HA, add it to `raw_fields`.
+
+| key | observed values | meaning (when decoded) |
+|---|---|---|
+| `op_m` | 2 | _undecoded_ |
+| `bat_m` | 4 | _undecoded_ |
+| `ac_m` | 2 | _undecoded_ |
+| `conn_m` | 2 | _undecoded_ |
+| `cell_m` | 2 | _undecoded_ |
+| `ble_m` | 2 | _undecoded_ |
+| `*_s` | _fill from the log_ | _undecoded_ |
+
+#### Baseline (2026-10-19, one unit, grid connected, idle)
+
+The `MODE/SETTINGS:` and `RAW _s/_m:` log lines read:
+
+| key | value | key | value |
+|---|---|---|---|
+| `op_m` | 2 | `dmse` | 1 |
+| `bat_m` | 4 | `slse` | 0 |
+| `ac_m` | 2 | `gicl` | 150 |
+| `conn_m` | 2 | `fchg` | 0 |
+| `cell_m` | 2 | `usoe` | 1 |
+| `ble_m` | 2 | `axoe` | 0 |
+
+Compare against this when decoding: a value that differs from it marks the key that a
+state change moved.
+
 ### Identity / connectivity
 | field | meaning | example |
 |---|---|---|
