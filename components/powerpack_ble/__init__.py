@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import sensor, text_sensor, ble_client
+from esphome.components import binary_sensor, sensor, text_sensor, ble_client
 from esphome.const import (
     CONF_ID,
     UNIT_PERCENT,
@@ -19,13 +19,15 @@ from esphome.const import (
     DEVICE_CLASS_FREQUENCY,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_SIGNAL_STRENGTH,
+    DEVICE_CLASS_CONNECTIVITY,
+    ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
 )
 
 CODEOWNERS = ["@poindexter12"]
 DEPENDENCIES = ["ble_client"]
-AUTO_LOAD = ["sensor", "text_sensor"]
+AUTO_LOAD = ["binary_sensor", "sensor", "text_sensor"]
 
 powerpack_ble_ns = cg.esphome_ns.namespace("powerpack_ble")
 PowerPackBLE = powerpack_ble_ns.class_(
@@ -37,6 +39,8 @@ CONF_CHARACTERISTIC_UUID = "characteristic_uuid"
 CONF_CONTROL_CHARACTERISTIC_UUID = "control_characteristic_uuid"
 CONF_RAW_FIELDS = "raw_fields"
 CONF_KEY = "key"
+CONF_CONNECTED = "connected"
+CONF_LAST_FRAME_AGE = "last_frame_age"
 
 # raw_fields: publish chosen JSON keys verbatim as text sensors, on change only. No
 # wildcard: ESPHome entities are fixed at compile time, so every key needs its own
@@ -121,6 +125,18 @@ CONFIG_SCHEMA = (
                 default="6d1b33f8-0014-11eb-a8b3-0242ac130003",
             ): cv.string,
             **{cv.Optional(k): schema for k, (_, schema) in SENSORS.items()},
+            # Link health, polled every 10 s (not per frame).
+            cv.Optional(CONF_CONNECTED): binary_sensor.binary_sensor_schema(
+                device_class=DEVICE_CLASS_CONNECTIVITY,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
+            cv.Optional(CONF_LAST_FRAME_AGE): sensor.sensor_schema(
+                unit_of_measurement=UNIT_SECOND,
+                device_class=DEVICE_CLASS_DURATION,
+                state_class=STATE_CLASS_MEASUREMENT,
+                accuracy_decimals=0,
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            ),
             cv.Optional(CONF_RAW_FIELDS): cv.All(
                 cv.ensure_list(RAW_FIELD_SCHEMA), _unique_raw_keys
             ),
@@ -145,3 +161,9 @@ async def to_code(config):
     for rf in config.get(CONF_RAW_FIELDS, []):
         ts = await text_sensor.new_text_sensor(rf)
         cg.add(var.add_raw_field(rf[CONF_KEY], ts))
+    if CONF_CONNECTED in config:
+        bs = await binary_sensor.new_binary_sensor(config[CONF_CONNECTED])
+        cg.add(var.set_connected_sensor(bs))
+    if CONF_LAST_FRAME_AGE in config:
+        age = await sensor.new_sensor(config[CONF_LAST_FRAME_AGE])
+        cg.add(var.set_last_frame_age_sensor(age))

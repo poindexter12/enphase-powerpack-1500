@@ -47,10 +47,22 @@ static float extract_num(const std::string &o, const std::string &key) {
   if (p == std::string::npos)
     return NAN;
   p += pat.size();
-  while (p < o.size() && o[p] == ' ')
-    p++;
-  return strtof(o.c_str() + p, nullptr);
+  // strtof skips leading whitespace itself. If it consumed nothing (a string, true,
+  // false, null, an object), the key has no numeric value: NAN, never a fake 0.
+  const char *s = o.c_str() + p;
+  char *end = nullptr;
+  float v = strtof(s, &end);
+  if (end == s)
+    return NAN;
+  return v;
 }
+
+// A buffered partial frame longer than this is discarded (no real frame is near it).
+static const size_t MAX_BUFFER = 16384;
+// last_frame_age / connected poll period. Kept at 10 s so HA is not flooded per frame.
+static const uint32_t POLL_INTERVAL_MS = 10000;
+// Text sensors cannot hold NAN. HA maps this literal state to its own "unknown".
+static const char *const UNKNOWN_TEXT = "unknown";
 
 // --- Raw JSON scanning (string-safe) ---
 // Index just past the string starting at o[i] == '"' (handles backslash escapes).
@@ -198,7 +210,7 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       if (param->read.status == ESP_GATT_OK && param->read.handle == this->char_handle_ &&
           param->read.value_len > 0) {
         this->buf_.append((const char *) param->read.value, param->read.value_len);
-        this->process_buffer_();
+        this->process_buffer_();  // applies the MAX_BUFFER cap on this path too
       }
       break;
     }
@@ -216,8 +228,6 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       if (param->notify.handle != this->char_handle_)
         break;
       this->buf_.append((const char *) param->notify.value, param->notify.value_len);
-      if (this->buf_.size() > 16384)
-        this->buf_.clear();
       this->process_buffer_();
       break;
     }
@@ -226,6 +236,7 @@ void PowerPackBLE::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->buf_.clear();
       this->char_handle_ = 0;
       this->control_handle_ = 0;
+      this->publish_unavailable_();
       break;
     }
     default:
@@ -270,34 +281,90 @@ void PowerPackBLE::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
   }
 }
 
+void PowerPackBLE::loop() {
+  const uint32_t now = millis();
+  if (now - this->last_poll_ms_ < POLL_INTERVAL_MS)
+    return;
+  this->last_poll_ms_ = now;
+  if (this->connected_sensor_ != nullptr)
+    this->connected_sensor_->publish_state(this->parent()->connected());
+  // No frame since boot: leave it without a state rather than invent an age.
+  if (this->last_frame_age_sensor_ != nullptr && this->have_frame_)
+    this->last_frame_age_sensor_->publish_state((now - this->last_frame_ms_) / 1000.0f);
+}
+
+void PowerPackBLE::publish_unavailable_() {
+  if (this->connected_sensor_ != nullptr)
+    this->connected_sensor_->publish_state(false);
+  if (this->unavailable_published_)
+    return;
+  this->unavailable_published_ = true;
+  ESP_LOGI(TAG, "link lost: field sensors -> NAN, raw fields -> \"%s\"", UNKNOWN_TEXT);
+  for (auto &field : this->fields_)
+    field.second->publish_state(NAN);
+  for (auto &rf : this->raw_fields_) {
+    rf.sensor->publish_state(UNKNOWN_TEXT);
+    rf.last.clear();
+    rf.published = false;  // the first frame after reconnect republishes every key
+  }
+  // Re-log both signatures on the first frame after reconnect.
+  this->mode_sig_.clear();
+  this->raw_sig_.clear();
+}
+
 void PowerPackBLE::process_buffer_() {
-  // Extract every complete top-level {...} object from the growing buffer.
-  while (true) {
-    int depth = 0, start = -1, endp = -1;
-    for (size_t i = 0; i < this->buf_.size(); i++) {
-      char c = this->buf_[i];
-      if (c == '{') {
-        if (depth == 0)
-          start = (int) i;
-        depth++;
-      } else if (c == '}') {
-        depth--;
-        if (depth == 0) {
-          endp = (int) i;
-          break;
-        }
+  // Extract every complete top-level {...} object from the buffer in one pass.
+  // Braces inside JSON strings do not count (honouring \" escapes); a quote outside
+  // any object is junk and ignored. A '}' with no open object (depth would go
+  // negative) resets the scan and discards every byte through it, so one stray
+  // brace can no longer wedge the parser until the size cap clears it.
+  const size_t n = this->buf_.size();
+  int depth = 0;
+  bool in_str = false, esc = false;
+  size_t start = 0, keep_from = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char c = this->buf_[i];
+    if (in_str) {
+      if (esc)
+        esc = false;
+      else if (c == '\\')
+        esc = true;
+      else if (c == '"')
+        in_str = false;
+      continue;
+    }
+    if (c == '"') {
+      if (depth > 0)
+        in_str = true;
+    } else if (c == '{') {
+      if (depth == 0)
+        start = i;
+      depth++;
+    } else if (c == '}') {
+      if (depth == 0) {
+        ESP_LOGD(TAG, "stray '}' at offset %u, discarding %u byte(s)", (unsigned) i, (unsigned) (i + 1 - keep_from));
+        keep_from = i + 1;
+        continue;
+      }
+      if (--depth == 0) {
+        this->publish_frame_(this->buf_.substr(start, i - start + 1));
+        keep_from = i + 1;
       }
     }
-    if (endp < 0 || start < 0)
-      break;
-    std::string obj = this->buf_.substr(start, endp - start + 1);
-    this->buf_.erase(0, endp + 1);
-    this->publish_frame_(obj);
+  }
+  // Keep only an object still being received; anything before it is junk.
+  this->buf_.erase(0, depth > 0 ? start : n);
+  if (this->buf_.size() > MAX_BUFFER) {
+    ESP_LOGW(TAG, "partial frame exceeds %u bytes, discarding", (unsigned) MAX_BUFFER);
+    this->buf_.clear();
   }
 }
 
 void PowerPackBLE::publish_frame_(const std::string &json) {
   ESP_LOGV(TAG, "telemetry frame (%u bytes): %.60s...", (unsigned) json.size(), json.c_str());
+  this->last_frame_ms_ = millis();
+  this->have_frame_ = true;
+  this->unavailable_published_ = false;
   for (auto &field : this->fields_) {
     float v = extract_num(json, field.first);
     if (!std::isnan(v))
